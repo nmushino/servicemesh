@@ -1,0 +1,14 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. CALCPOINT.
+
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 AMOUNT PIC 9(6).
+       01 POINT  PIC 9(6).
+
+       PROCEDURE DIVISION.
+           ACCEPT AMOUNT
+           COMPUTE POINT = AMOUNT / 10
+           DISPLAY POINT
+           STOP RUN.
+        
