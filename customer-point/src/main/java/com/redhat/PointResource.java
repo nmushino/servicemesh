@@ -1,4 +1,4 @@
-package com.redhat.cobol;
+package com.redhat;
 
 import jakarta.ws.rs.POST;
 import jakarta.ws.rs.Path;
@@ -10,7 +10,7 @@ import jakarta.ws.rs.core.MediaType;
 public class PointResource {
 
     @POST
-    @Consumes(MediaType.WILDCARD)   // 🔥 ここが最重要
+    @Consumes(MediaType.WILDCARD)
     @Produces(MediaType.TEXT_PLAIN)
     public String calcPoint(String body) {
 

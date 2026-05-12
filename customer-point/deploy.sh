@@ -9,12 +9,11 @@ PROJECT=demo
 BASE_DIR=$(pwd)
 DOCKER_CONTEXT_DIR=${BASE_DIR}/build
 DOCKERFILE_SRC=${BASE_DIR}/src/main/docker/Dockerfile
-COBOL_SRC=${BASE_DIR}/cobol-resources/customer-point.cbl
 QUARKUS_TARGET=${BASE_DIR}/target/quarkus-app
 
 RATELIMIT_NS=ratelimit
 REDIS_IMAGE=redis:7.0
-RATELIMIT_IMAGE=envoyproxy/ratelimit:latest
+RATELIMIT_IMAGE=envoyproxy/ratelimit:v1.4.0
 
 ISTIO_NAMESPACE=istio-system
 
@@ -32,7 +31,6 @@ mvn clean package -DskipTests
 rm -rf ${DOCKER_CONTEXT_DIR}
 mkdir -p ${DOCKER_CONTEXT_DIR}
 cp ${DOCKERFILE_SRC} ${DOCKER_CONTEXT_DIR}/Dockerfile
-cp ${COBOL_SRC} ${DOCKER_CONTEXT_DIR}/customer-point.cbl
 cp entrypoint.sh ${DOCKER_CONTEXT_DIR}/entrypoint.sh
 mkdir -p ${DOCKER_CONTEXT_DIR}/quarkus-app
 cp -r ${QUARKUS_TARGET}/* ${DOCKER_CONTEXT_DIR}/quarkus-app/
@@ -75,6 +73,7 @@ oc expose deployment ${APP_NAME} --port=8080 -n ${PROJECT} || true
 # ----------------------------
 echo "===== Apply RateLimit ====="
 oc create namespace ${RATELIMIT_NS} || true
+
 cat <<EOF | oc apply -n ${RATELIMIT_NS} -f -
 apiVersion: v1
 kind: ConfigMap
@@ -84,14 +83,14 @@ data:
   config.yaml: |
     domain: customerpoint
     descriptors:
-    - key: PATH
-      value: "/customerpoint"
+    - key: generic_key
+      value: customerpoint
       rate_limit:
         unit: minute
         requests_per_unit: 10
 EOF
 
-# Redis + RLS
+# Redis
 oc apply -n ${RATELIMIT_NS} -f - <<EOF
 apiVersion: apps/v1
 kind: Deployment
@@ -123,6 +122,7 @@ spec:
   - port: 6379
 EOF
 
+# RateLimit Service
 cat <<EOF | oc apply -n ${RATELIMIT_NS} -f -
 apiVersion: apps/v1
 kind: Deployment
@@ -142,12 +142,16 @@ spec:
         image: ${RATELIMIT_IMAGE}
         command: ["/bin/ratelimit"]
         env:
+        - name: LOG_LEVEL
+          value: debug
+        - name: REDIS_SOCKET_TYPE
+          value: tcp
+        - name: REDIS_URL
+          value: redis:6379
         - name: RUNTIME_ROOT
           value: /data
         - name: RUNTIME_SUBDIRECTORY
           value: config
-        - name: REDIS_URL
-          value: redis:6379
         volumeMounts:
         - name: config
           mountPath: /data/config/config.yaml
@@ -171,44 +175,24 @@ spec:
 EOF
 
 # ----------------------------
-echo "===== Enable Istio Ambient ====="
-cat <<EOF | oc apply -n ${ISTIO_NAMESPACE} -f -
-apiVersion: sailoperator.io/v1
-kind: Istio
-metadata:
-  name: ambient-mesh
-spec:
-  namespace: ${ISTIO_NAMESPACE}
-  profile: openshift-ambient
-  version: v1.28.5
-  components:
-    ingressGateways:
-    - name: istio-ingressgateway
-      enabled: true
-EOF
-
-echo "Waiting for ingressgateway..."
-until oc get svc istio-ingressgateway -n ${ISTIO_NAMESPACE} >/dev/null 2>&1; do sleep 5; done
-
-# ----------------------------
 echo "===== Configure Gateway API ====="
-cat <<EOF | oc apply -n istio-system -f -
+cat <<EOF | oc apply -n ${ISTIO_NAMESPACE} -f -
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: external-gateway
-  namespace: istio-system
 spec:
   gatewayClassName: istio
   listeners:
   - name: http
-    protocol: HTTP
     port: 80
-    hostnames:
-    - "*"
+    protocol: HTTP
     allowedRoutes:
       namespaces:
-        from: All
+        from: Selector
+        selector:
+          matchLabels:
+            kubernetes.io/metadata.name: demo
 EOF
 
 cat <<EOF | oc apply -n ${PROJECT} -f -
@@ -216,12 +200,10 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
   name: customer-point
-  namespace: demo
 spec:
   parentRefs:
   - name: external-gateway
-    namespace: istio-system
-    port: 80   # listener の port を明示
+    namespace: ${ISTIO_NAMESPACE}
   rules:
   - matches:
     - path:
@@ -232,55 +214,71 @@ spec:
       port: 8080
 EOF
 
-cat <<EOF | oc apply -n ${PROJECT} -f -
-apiVersion: v1
-kind: Service
-metadata:
-  name: customer-point-api
-  namespace: demo
-spec:
-  selector:
-    app: customer-point-api
-  ports:
-  - port: 8080
-    targetPort: 8080
-EOF
-
-
-
 # ----------------------------
-echo "===== Apply Global RateLimit EnvoyFilter ====="
+echo "===== Apply EnvoyFilter ====="
 cat <<EOF | oc apply -n ${ISTIO_NAMESPACE} -f -
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
-  name: global-ratelimit
+  name: ratelimit-filter
   namespace: istio-system
+
 spec:
   workloadSelector:
     labels:
       istio: ingressgateway
 
-  priority: 10   # ← 🔥超重要
-
   configPatches:
+
+  # RateLimit Filter
   - applyTo: HTTP_FILTER
     match:
       context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+            subFilter:
+              name: envoy.filters.http.router
+
     patch:
-      operation: INSERT_FIRST   # ← 🔥これに変更
+      operation: INSERT_BEFORE
+
       value:
         name: envoy.filters.http.ratelimit
+
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+
           domain: customerpoint
-          failure_mode_deny: true
-          timeout: 5s
+
+          failure_mode_deny: false
+
           rate_limit_service:
+            transport_api_version: V3
+
             grpc_service:
               envoy_grpc:
                 cluster_name: outbound|8081||ratelimit.ratelimit.svc.cluster.local
-            transport_api_version: V3
+
+  # Route/VHost RateLimit
+  - applyTo: VIRTUAL_HOST
+
+    match:
+      context: GATEWAY
+
+      routeConfiguration:
+        vhost:
+          name: "*:80"
+
+    patch:
+      operation: MERGE
+
+      value:
+        rate_limits:
+        - actions:
+          - generic_key:
+              descriptor_value: customerpoint
 EOF
 
 # ----------------------------

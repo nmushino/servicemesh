@@ -9,13 +9,12 @@ PROJECT=demo
 BASE_DIR=$(pwd)
 DOCKER_CONTEXT_DIR=${BASE_DIR}/build
 DOCKERFILE_SRC=${BASE_DIR}/src/main/docker/Dockerfile
-COBOL_SRC=${BASE_DIR}/cobol-resources/customer-point.cbl
 QUARKUS_TARGET=${BASE_DIR}/target/quarkus-app
 
 # RateLimit用
 RATELIMIT_NS=ratelimit
 REDIS_IMAGE=redis:7.0
-RATELIMIT_IMAGE=envoyproxy/ratelimit:v1.4.0
+RATELIMIT_IMAGE=envoyproxy/ratelimit:master
 
 ISTIO_NAMESPACE=istio-system
 
@@ -46,7 +45,6 @@ rm -rf ${DOCKER_CONTEXT_DIR}
 mkdir -p ${DOCKER_CONTEXT_DIR}
 
 cp ${DOCKERFILE_SRC} ${DOCKER_CONTEXT_DIR}/Dockerfile
-cp ${COBOL_SRC} ${DOCKER_CONTEXT_DIR}/customer-point.cbl
 cp entrypoint.sh ${DOCKER_CONTEXT_DIR}/entrypoint.sh
 
 if [ -d "${QUARKUS_TARGET}" ]; then
@@ -145,20 +143,17 @@ spec:
     spec:
       containers:
       - name: redis
-        image: ${REDIS_IMAGE}
+        image: redis:7.0
+
+        command:
+        - redis-server
+        - --save
+        - ""
+        - --appendonly
+        - "no"
+
         ports:
         - containerPort: 6379
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: redis
-spec:
-  selector:
-    app: redis
-  ports:
-    - port: 6379
-      targetPort: 6379
 EOF
 
 # RateLimit Deployment + Service
@@ -205,8 +200,10 @@ spec:
             value: /data/config
           - name: RUNTIME_SUBDIRECTORY
             value: config
+          - name: REDIS_SOCKET_TYPE
+            value: tcp
           - name: REDIS_URL
-            value: "redis:6379"
+            value: redis:6379
         volumeMounts:
           - name: ratelimit-config
             mountPath: /data/config/config/config.yaml
@@ -214,12 +211,12 @@ spec:
         livenessProbe:
           httpGet:
             path: /healthcheck
-            port: 8080
+            port: 6070
           initialDelaySeconds: 15
         readinessProbe:
           httpGet:
             path: /healthcheck
-            port: 8080
+            port: 6070
           initialDelaySeconds: 10
       volumes:
         - name: ratelimit-config
@@ -234,8 +231,37 @@ spec:
   selector:
     app: ratelimit
   ports:
-    - port: 8081
-      targetPort: 8081
+  - name: grpc
+    port: 8081
+    protocol: TCP
+    targetPort: 8081
+  - name: http
+    port: 6070
+    protocol: TCP
+    targetPort: 6070
+EOF
+
+
+cat <<EOF | oc apply -n ${PROJECT} -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: customerpoint
+  namespace: demo
+spec:
+  parentRefs:
+  - name: external-gateway
+    namespace: istio-system
+
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /customerpoint
+
+    backendRefs:
+    - name: customer-point-api
+      port: 8080
 EOF
 
 # EnvoyFilter
@@ -244,85 +270,54 @@ EOF
 # ----------------------------
 echo "===== Apply EnvoyFilter for Gateway (RateLimit) ====="
 
-cat <<EOF | oc apply -n ${PROJECT} -f -
+cat <<EOF | oc apply -f -
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
   name: ratelimit-gateway
-  namespace: ${PROJECT}
+  namespace: istio-system
 spec:
-  workloadSelector:
-    labels:
-      istio.io/gateway-name: waypoint
   configPatches:
-    - applyTo: VIRTUAL_HOST
-      match:
-        context: GATEWAY
-      patch:
-        operation: MERGE
-        value:
+
+  - applyTo: HTTP_FILTER
+    match:
+      context: GATEWAY
+      listener:
+        filterChain:
+          filter:
+            name: envoy.filters.network.http_connection_manager
+
+    patch:
+      operation: INSERT_FIRST
+
+      value:
+        name: envoy.filters.http.ratelimit
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
+          domain: customerpoint
+          failure_mode_deny: true
+          timeout: 1s
+          rate_limit_service:
+            transport_api_version: V3
+            grpc_service:
+              envoy_grpc:
+                cluster_name: outbound|8081||ratelimit.ratelimit.svc.cluster.local
+
+  - applyTo: HTTP_ROUTE
+    match:
+      context: GATEWAY
+
+    patch:
+      operation: MERGE
+
+      value:
+        route:
           rate_limits:
-            - actions:
-                - generic_key:
-                    descriptor_value: default
-    - applyTo: CLUSTER
-      match:
-        context: GATEWAY
-      patch:
-        operation: ADD
-        value:
-          name: ratelimit_cluster
-          type: STRICT_DNS
-          connect_timeout: 1s
-          http2_protocol_options: {}
-          lb_policy: ROUND_ROBIN
-          load_assignment:
-            cluster_name: ratelimit_cluster
-            endpoints:
-            - lb_endpoints:
-              - endpoint:
-                  address:
-                    socket_address:
-                      address: ratelimit.ratelimit.svc.cluster.local
-                      port_value: 8081
-    - applyTo: HTTP_FILTER
-      match:
-        context: GATEWAY
-        listener:
-          filterChain:
-            filter:
-              name: envoy.filters.network.http_connection_manager
-              subFilter:
-                name: envoy.filters.http.router
-      patch:
-        operation: INSERT_BEFORE
-        value:
-          name: envoy.filters.http.ratelimit
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
-            domain: customerpoint
-            failure_mode_deny: true
-            rate_limit_service:
-              grpc_service:
-                envoy_grpc:
-                  cluster_name: ratelimit_cluster
-                timeout: 0.25s
+          - actions:
+            - generic_key:
+                descriptor_value: default
 EOF
 
-# Waypoint Gateway
-cat <<EOF | oc apply -n ${PROJECT} -f -
-apiVersion: gateway.networking.k8s.io/v1
-kind: Gateway
-metadata:
-  name: waypoint
-  namespace: demo
-spec:
-  gatewayClassName: istio-waypoint
-  listeners:
-  - name: mesh
-    port: 15008
-    protocol: HBONE
-EOF
 kubectl label namespace ${PROJECT} istio.io/use-waypoint=waypoint --overwrite
 
 echo "===== DONE: RateLimit + Redis + EnvoyFilter + Waypoint applied ====="
