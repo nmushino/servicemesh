@@ -220,7 +220,7 @@ spec:
         ports:
         - containerPort: 8081
 
-        env:
+        env:çç
         - name: CONFIG_TYPE
           value: FILE
         - name: RUNTIME_ROOT
