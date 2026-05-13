@@ -1,0 +1,39 @@
+syntax = "proto3";
+
+package envoy.service.ratelimit.v3;
+
+option java_multiple_files = true;
+option java_package = "envoy.service.ratelimit.v3";
+option java_outer_classname = "RateLimitProto";
+
+service RateLimitService {
+  rpc ShouldRateLimit (RateLimitRequest)
+      returns (RateLimitResponse);
+}
+
+message RateLimitRequest {
+  message RateLimitDescriptor {
+
+    message Entry {
+      string key = 1;
+      string value = 2;
+    }
+
+    repeated Entry entries = 1;
+  }
+
+  string domain = 1;
+
+  repeated RateLimitDescriptor descriptors = 2;
+}
+
+message RateLimitResponse {
+
+  enum Code {
+    UNKNOWN = 0;
+    OK = 1;
+    OVER_LIMIT = 2;
+  }
+
+  Code overall_code = 1;
+}

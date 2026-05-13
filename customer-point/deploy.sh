@@ -17,6 +17,8 @@ RATELIMIT_IMAGE=envoyproxy/ratelimit:v1.4.0
 
 ISTIO_NAMESPACE=istio-system
 
+SLEEP_INTERVAL=10
+
 # ----------------------------
 echo "===== OpenShift Login ====="
 oc whoami >/dev/null
@@ -41,6 +43,22 @@ oc new-build --name=${APP_NAME} --binary --strategy=docker
 oc start-build ${APP_NAME} --from-dir=${DOCKER_CONTEXT_DIR} --follow
 
 IMAGE_NAME=$(oc get istag ${APP_NAME}:latest -o jsonpath='{.image.dockerImageReference}')
+
+echo "===== Install Istio ====="
+oc adm policy add-scc-to-user anyuid -z istio-egressgateway-service-account -n ${ISTIO_NAMESPACE} || true
+oc adm policy add-scc-to-user anyuid -z istio-ingressgateway-service-account -n ${ISTIO_NAMESPACE} || true
+
+if oc get deployment istiod -n ${ISTIO_NAMESPACE} >/dev/null 2>&1; then
+  echo "Istio already installed, skipping istioctl install"
+else
+  echo "Installing Istio..."
+  istioctl install --set profile=demo -y
+fi
+
+echo "===== Wait Istio ====="
+oc wait --for=condition=available deployment/istiod -n ${ISTIO_NAMESPACE} --timeout=300s
+oc wait --for=condition=available deployment/istio-egressgateway -n ${ISTIO_NAMESPACE} --timeout=300s
+oc wait --for=condition=available deployment/istio-ingressgateway -n ${ISTIO_NAMESPACE} --timeout=300s
 
 # ----------------------------
 echo "===== Deploy App ====="

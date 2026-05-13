@@ -1,72 +1,69 @@
 #!/bin/bash
 set -e
 
-# ----------------------------
-# 設定
-# ----------------------------
+# --------------------------------------------------
+# Settings
+# --------------------------------------------------
 APP_NAME=customer-point-api
 PROJECT=demo
+
 BASE_DIR=$(pwd)
 DOCKER_CONTEXT_DIR=${BASE_DIR}/build
 DOCKERFILE_SRC=${BASE_DIR}/src/main/docker/Dockerfile
 QUARKUS_TARGET=${BASE_DIR}/target/quarkus-app
 
-# RateLimit用
-RATELIMIT_NS=ratelimit
+ISTIO_NAMESPACE=istio-system
+RATELIMIT_NAMESPACE=ratelimit
+
 REDIS_IMAGE=redis:7.0
 RATELIMIT_IMAGE=envoyproxy/ratelimit:master
 
-ISTIO_NAMESPACE=istio-system
-
-# ----------------------------
-# OpenShift Login / Project
-# ----------------------------
 echo "===== OpenShift Login Check ====="
 oc whoami
 
-echo "===== Use Project ====="
+# --------------------------------------------------
+# Project
+# --------------------------------------------------
+echo "===== Project ====="
 oc new-project ${PROJECT} || oc project ${PROJECT}
 
-# Ambient Mesh ラベル設定
-oc label namespace ${PROJECT} istio.io/dataplane-mode=ambient --overwrite
+oc label namespace ${PROJECT} \
+  istio.io/dataplane-mode=ambient \
+  --overwrite
 
-# ----------------------------
-# Build
-# ----------------------------
-echo "===== Delete old BuildConfig and ImageStream ====="
-oc delete bc ${APP_NAME} || true
-oc delete is ${APP_NAME} || true
+# --------------------------------------------------
+# Build App
+# --------------------------------------------------
+echo "===== Build ====="
 
-echo "===== Build Quarkus App ====="
+oc delete bc ${APP_NAME} --ignore-not-found=true
+oc delete is ${APP_NAME} --ignore-not-found=true
+
 mvn clean package -DskipTests
 
-echo "===== Prepare build context ====="
 rm -rf ${DOCKER_CONTEXT_DIR}
 mkdir -p ${DOCKER_CONTEXT_DIR}
 
 cp ${DOCKERFILE_SRC} ${DOCKER_CONTEXT_DIR}/Dockerfile
 cp entrypoint.sh ${DOCKER_CONTEXT_DIR}/entrypoint.sh
 
-if [ -d "${QUARKUS_TARGET}" ]; then
-    mkdir -p ${DOCKER_CONTEXT_DIR}/quarkus-app
-    cp -r ${QUARKUS_TARGET}/* ${DOCKER_CONTEXT_DIR}/quarkus-app/
-fi
+mkdir -p ${DOCKER_CONTEXT_DIR}/quarkus-app
+cp -r ${QUARKUS_TARGET}/* ${DOCKER_CONTEXT_DIR}/quarkus-app/
 
-echo "===== Create BuildConfig ====="
 oc new-build --name=${APP_NAME} --binary --strategy=docker
-
-echo "===== Start Binary Build ====="
 oc start-build ${APP_NAME} --from-dir=${DOCKER_CONTEXT_DIR} --follow
 
-# ----------------------------
-# Deploy Application
-# ----------------------------
-echo "===== Deploy Application ====="
-IMAGE_NAME=$(oc get istag ${APP_NAME}:latest -o jsonpath='{.image.dockerImageReference}')
+# --------------------------------------------------
+# Deploy App
+# --------------------------------------------------
+echo "===== Deploy App ====="
 
-oc delete deployment ${APP_NAME} || true
+IMAGE_NAME=$(oc get istag ${APP_NAME}:latest \
+  -o jsonpath='{.image.dockerImageReference}')
 
-cat <<EOF | oc apply -f -
+oc delete deployment ${APP_NAME} --ignore-not-found=true
+
+cat <<EOF | oc apply -n ${PROJECT} -f -
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -76,61 +73,64 @@ spec:
   selector:
     matchLabels:
       app: ${APP_NAME}
-      deployment: ${APP_NAME}
   template:
     metadata:
       labels:
         app: ${APP_NAME}
-        deployment: ${APP_NAME}
     spec:
       containers:
       - name: ${APP_NAME}
         image: ${IMAGE_NAME}
         ports:
         - containerPort: 8080
+        - containerPort: 9000
+        env:
+        - name: QUARKUS_REDIS_HOSTS
+          value: redis://redis.${RATELIMIT_NAMESPACE}.svc.cluster.local:6379
+        - name: QUARKUS_GRPC_SERVER_PORT
+          value: "9000"
+        - name: RATELIMIT_WINDOW_MS
+          value: "60000"
+        - name: RATELIMIT_MAX_REQUESTS
+          value: "4"
 EOF
 
-echo "===== List Pods ====="
-oc get pods
+oc rollout status deployment/${APP_NAME} -n ${PROJECT}
 
-# Service作成
-if oc get svc ${APP_NAME} >/dev/null 2>&1; then
-    oc patch svc ${APP_NAME} -p '{"spec":{"selector":{"app":"'"${APP_NAME}"'","deployment":"'"${APP_NAME}"'"}}}'
-else
-    oc expose deployment ${APP_NAME} --port=8080
-fi
-oc expose svc/${APP_NAME} || true
-
-# ----------------------------
-# RateLimit + Redis 設定
-# ----------------------------
-echo "===== Apply RateLimit Components ====="
-
-oc create namespace ${RATELIMIT_NS} || echo "Namespace ${RATELIMIT_NS} already exists"
-
-# ConfigMap
-cat <<EOF | oc apply -n ${RATELIMIT_NS} -f -
+# --------------------------------------------------
+# Service (App)
+# --------------------------------------------------
+cat <<EOF | oc apply -n ${PROJECT} -f -
 apiVersion: v1
-kind: ConfigMap
+kind: Service
 metadata:
-  name: ratelimit-config
-data:
-  config.yaml: |
-    domain: customerpoint
-    descriptors:
-      - key: generic_key
-        value: default
-        rate_limit:
-          unit: minute
-          requests_per_unit: 10
+  name: ${APP_NAME}
+spec:
+  selector:
+    app: ${APP_NAME}
+  ports:
+  - name: http
+    port: 8080
+    targetPort: 8080
 EOF
 
-# Redis Deployment + Service
-cat <<EOF | oc apply -n ${RATELIMIT_NS} -f -
+# --------------------------------------------------
+# Redis + RateLimit backend
+# --------------------------------------------------
+echo "===== Redis & RateLimit ====="
+
+oc create namespace ${RATELIMIT_NAMESPACE} || true
+
+cat <<EOF | oc apply -n ${RATELIMIT_NAMESPACE} -f -
+
+# -------------------------
+# Redis
+# -------------------------
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: redis
+  namespace: ${RATELIMIT_NAMESPACE}
 spec:
   replicas: 1
   selector:
@@ -143,27 +143,67 @@ spec:
     spec:
       containers:
       - name: redis
-        image: redis:7.0
-
-        command:
-        - redis-server
-        - --save
-        - ""
-        - --appendonly
-        - "no"
-
+        image: ${REDIS_IMAGE}
         ports:
         - containerPort: 6379
-EOF
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: ${RATELIMIT_NAMESPACE}
+spec:
+  selector:
+    app: redis
+  ports:
+  - port: 6379
+    targetPort: 6379
 
-# RateLimit Deployment + Service
-oc -n ${RATELIMIT_NS} delete deployment ratelimit --ignore-not-found
+# -------------------------
+# ConfigMap (IMPORTANT)
+# -------------------------
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ratelimit-config
+  namespace: ${RATELIMIT_NAMESPACE}
+data:
+  config.yaml: |
+    domain: customerpoint
+    descriptors:
+      - key: generic_key
+        value: customerpoint
+        rate_limit:
+          unit: minute
+          requests_per_unit: 4
 
-cat <<EOF | oc apply -n ${RATELIMIT_NS} -f -
+# -------------------------
+# RateLimit Service
+# -------------------------
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ratelimit
+  namespace: ${RATELIMIT_NAMESPACE}
+spec:
+  selector:
+    app: ratelimit
+  ports:
+  - name: grpc
+    port: 8081
+    targetPort: 8081
+
+# -------------------------
+# RateLimit Deployment (FIXED)
+# -------------------------
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: ratelimit
+  namespace: ${RATELIMIT_NAMESPACE}
 spec:
   replicas: 1
   selector:
@@ -174,111 +214,71 @@ spec:
       labels:
         app: ratelimit
     spec:
-      initContainers:
-      - name: wait-for-redis
-        image: busybox
-        command:
-        - sh
-        - -c
-        - |
-          echo "Waiting for Redis..."
-          for i in \$(seq 1 30); do
-            nc -z redis 6379 && break
-            sleep 2
-          done
-          if ! nc -z redis 6379; then
-            echo "Redis not available"
-            exit 1
-          fi
-          echo "Redis is up!"
       containers:
       - name: ratelimit
         image: ${RATELIMIT_IMAGE}
-        command: ["/bin/ratelimit"]
+        ports:
+        - containerPort: 8081
+
         env:
-          - name: RUNTIME_ROOT
-            value: /data/config
-          - name: RUNTIME_SUBDIRECTORY
-            value: config
-          - name: REDIS_SOCKET_TYPE
-            value: tcp
-          - name: REDIS_URL
-            value: redis:6379
+        - name: CONFIG_TYPE
+          value: FILE
+        - name: RUNTIME_ROOT
+          value: /data
+        - name: RUNTIME_SUBDIRECTORY
+          value: ratelimit
+
+        - name: REDIS_SOCKET_TYPE
+          value: tcp
+        - name: REDIS_URL
+          value: redis://redis.${RATELIMIT_NAMESPACE}.svc.cluster.local:6379
+
+        - name: USE_STATSD
+          value: "false"
+        - name: USE_REDIS
+          value: "true"
+
         volumeMounts:
-          - name: ratelimit-config
-            mountPath: /data/config/config/config.yaml
-            subPath: config.yaml
-        livenessProbe:
-          httpGet:
-            path: /healthcheck
-            port: 6070
-          initialDelaySeconds: 15
-        readinessProbe:
-          httpGet:
-            path: /healthcheck
-            port: 6070
-          initialDelaySeconds: 10
+        - name: config
+          mountPath: /data/ratelimit
+          readOnly: true
+
       volumes:
-        - name: ratelimit-config
-          configMap:
-            name: ratelimit-config
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: ratelimit
-spec:
-  selector:
-    app: ratelimit
-  ports:
-  - name: grpc
-    port: 8081
-    protocol: TCP
-    targetPort: 8081
-  - name: http
-    port: 6070
-    protocol: TCP
-    targetPort: 6070
+      - name: config
+        configMap:
+          name: ratelimit-config
+          items:
+          - key: config.yaml
+            path: config.yaml
 EOF
 
+# --------------------------------------------------
+# Gateway label
+# --------------------------------------------------
+oc label gateway external-gateway -n ${ISTIO_NAMESPACE} \
+  gateway.networking.k8s.io/gateway-name=external-gateway \
+  --overwrite
 
-cat <<EOF | oc apply -n ${PROJECT} -f -
-apiVersion: gateway.networking.k8s.io/v1
-kind: HTTPRoute
-metadata:
-  name: customerpoint
-  namespace: demo
-spec:
-  parentRefs:
-  - name: external-gateway
-    namespace: istio-system
-
-  rules:
-  - matches:
-    - path:
-        type: PathPrefix
-        value: /customerpoint
-
-    backendRefs:
-    - name: customer-point-api
-      port: 8080
-EOF
-
+# --------------------------------------------------
 # EnvoyFilter
-# ----------------------------
-# EnvoyFilter（Gateway向け）適用
-# ----------------------------
-echo "===== Apply EnvoyFilter for Gateway (RateLimit) ====="
+# --------------------------------------------------
+echo "===== EnvoyFilter ====="
 
-cat <<EOF | oc apply -f -
+cat <<EOF | oc apply -n ${ISTIO_NAMESPACE} -f -
 apiVersion: networking.istio.io/v1alpha3
 kind: EnvoyFilter
 metadata:
-  name: ratelimit-gateway
-  namespace: istio-system
+  name: ratelimit
+  namespace: ${ISTIO_NAMESPACE}
+
 spec:
+  workloadSelector:
+    labels:
+      gateway.networking.k8s.io/gateway-name: external-gateway
+
   configPatches:
 
+  # HTTP FILTER
   - applyTo: HTTP_FILTER
     match:
       context: GATEWAY
@@ -286,38 +286,56 @@ spec:
         filterChain:
           filter:
             name: envoy.filters.network.http_connection_manager
-
+            subFilter:
+              name: envoy.filters.http.router
     patch:
-      operation: INSERT_FIRST
-
+      operation: INSERT_BEFORE
       value:
         name: envoy.filters.http.ratelimit
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.http.ratelimit.v3.RateLimit
           domain: customerpoint
-          failure_mode_deny: true
-          timeout: 1s
+          failure_mode_deny: false
           rate_limit_service:
             transport_api_version: V3
             grpc_service:
               envoy_grpc:
-                cluster_name: outbound|8081||ratelimit.ratelimit.svc.cluster.local
+                cluster_name: ratelimit_cluster
 
+  # CLUSTER
+  - applyTo: CLUSTER
+    match:
+      context: GATEWAY
+    patch:
+      operation: ADD
+      value:
+        name: ratelimit_cluster
+        type: STRICT_DNS
+        connect_timeout: 1s
+        http2_protocol_options: {}
+        lb_policy: ROUND_ROBIN
+        load_assignment:
+          cluster_name: ratelimit_cluster
+          endpoints:
+          - lb_endpoints:
+            - endpoint:
+                address:
+                  socket_address:
+                    address: ratelimit.ratelimit.svc.cluster.local
+                    port_value: 8081
+
+  # ROUTE
   - applyTo: HTTP_ROUTE
     match:
       context: GATEWAY
-
     patch:
       operation: MERGE
-
       value:
         route:
           rate_limits:
           - actions:
             - generic_key:
-                descriptor_value: default
+                descriptor_value: customerpoint
 EOF
 
-kubectl label namespace ${PROJECT} istio.io/use-waypoint=waypoint --overwrite
-
-echo "===== DONE: RateLimit + Redis + EnvoyFilter + Waypoint applied ====="
+echo "===== DONE ====="
