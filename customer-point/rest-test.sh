@@ -31,7 +31,7 @@ request() {
     -X POST "$URL" \
     -H "Host: ${HOST_HEADER}" \
     -H "Content-Type: text/plain" \
-    -H "x-tenant: silver" \
+    -H "x-tenant: free" \
     -d "1000")
 
   echo "$(date '+%H:%M:%S') -> $STATUS"
