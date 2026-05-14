@@ -41,7 +41,7 @@ sleep 15
 echo ""
 echo "=== Retry ==="
 
-for i in {1..15}; do
+for i in {1..30}; do
   request
   sleep 0.5
 done
