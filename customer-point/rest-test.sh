@@ -2,7 +2,7 @@
 set -e
 
 #######################################################
-# リクエストプランは、下記のプランで実行することが可能
+# リクエストプランは、下記のテナントプランで実行することが可能
 #  * gold 30/min
 #  * silver 15/min
 #  * free 5/min
@@ -10,7 +10,6 @@ set -e
 #  具体的には-H "x-tenant: free" と設定する
 #
 #######################################################
-
 
 ELB_HOST=$(oc get svc external-gateway-istio \
   -n istio-system \
@@ -32,7 +31,7 @@ request() {
     -X POST "$URL" \
     -H "Host: ${HOST_HEADER}" \
     -H "Content-Type: text/plain" \
-    -H "x-tenant: free" \
+    -H "x-tenant: silver" \
     -d "1000")
 
   echo "$(date '+%H:%M:%S') -> $STATUS"

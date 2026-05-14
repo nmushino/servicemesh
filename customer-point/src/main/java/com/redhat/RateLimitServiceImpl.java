@@ -5,6 +5,8 @@ import java.util.Map;
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+
 import io.grpc.stub.StreamObserver;
 import io.quarkus.grpc.GrpcService;
 import io.vertx.mutiny.redis.client.Command;
@@ -23,20 +25,14 @@ public class RateLimitServiceImpl
     @Inject
     Redis redis;
 
-    /**
-     * tenantごとの制限値
-     */
-    private static final Map<String, Long> LIMITS =
-            Map.of(
-                    "gold", 30L,
-                    "silver", 15L,
-                    "free", 5L
-            );
-
-    /**
-     * window(sec)
-     */
-    private static final long WINDOW_SECONDS = 60;
+    @ConfigProperty(name = "ratelimit.window-seconds", defaultValue = "60")
+    long windowSeconds;
+    @ConfigProperty(name = "ratelimit.gold-limit", defaultValue = "30")
+    long goldLimit;
+    @ConfigProperty(name = "ratelimit.silver-limit", defaultValue = "15")
+    long silverLimit;
+    @ConfigProperty(name = "ratelimit.free-limit", defaultValue = "5")
+    long freeLimit;
 
     @Override
     public void shouldRateLimit(
@@ -44,15 +40,8 @@ public class RateLimitServiceImpl
             StreamObserver<RateLimitResponse> responseObserver) {
 
         String clientKey = buildKey(request);
-
-        // tenant抽出
         String tenant = extractTenant(clientKey);
-
-        // tenant別limit
-        long limit =
-                LIMITS.getOrDefault(tenant, 5L);
-
-        // Redis key
+        long limit = resolveLimit(tenant);
         String redisKey = "rl:" + clientKey;
 
         redis.send(
@@ -73,7 +62,7 @@ public class RateLimitServiceImpl
                             Request.cmd(Command.EXPIRE)
                                     .arg(redisKey)
                                     .arg(String.valueOf(
-                                            WINDOW_SECONDS)))
+                                            windowSeconds)))
                     .subscribe()
                     .with(
                             x -> {},
@@ -119,6 +108,19 @@ public class RateLimitServiceImpl
                 responseObserver.onCompleted();
             }
         );
+    }
+
+    /**
+     * tenant別limit
+     */
+    private long resolveLimit(String tenant) {
+
+        return switch (tenant) {
+            case "gold" -> goldLimit;
+            case "silver" -> silverLimit;
+            case "free" -> freeLimit;
+            default -> freeLimit;
+        };
     }
 
     /**

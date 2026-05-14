@@ -63,6 +63,17 @@ IMAGE_NAME=$(oc get istag ${APP_NAME}:latest \
 oc delete deployment ${APP_NAME} --ignore-not-found=true
 
 cat <<EOF | oc apply -n ${PROJECT} -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ratelimit-config
+data:
+  RATELIMIT_WINDOW_SECONDS: "60"
+
+  GOLD_LIMIT: "30"
+  SILVER_LIMIT: "15"
+  FREE_LIMIT: "5"
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -98,10 +109,9 @@ spec:
           value: redis://redis.${RATELIMIT_NAMESPACE}.svc.cluster.local:6379
         - name: QUARKUS_GRPC_SERVER_PORT
           value: "9000"
-        - name: RATELIMIT_LIMIT
-          value: "5"
-        - name: RATELIMIT_WINDOW_SECONDS
-          value: "60"
+        envFrom:
+        - configMapRef:
+            name: ratelimit-config
 EOF
 
 oc rollout status deployment/${APP_NAME} -n ${PROJECT}
