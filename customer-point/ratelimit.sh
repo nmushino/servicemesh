@@ -259,8 +259,9 @@ spec:
       value:
         rate_limits:
         - actions:
-          - generic_key:
-              descriptor_value: customerpoint
+          - request_headers:
+              header_name: x-tenant
+              descriptor_key: tenant
 EOF
 
 echo "===== DONE ====="

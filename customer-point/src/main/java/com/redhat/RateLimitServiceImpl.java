@@ -1,9 +1,9 @@
 package com.redhat;
 
+import java.util.Map;
+
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
-
-import org.eclipse.microprofile.config.inject.ConfigProperty;
 
 import io.grpc.stub.StreamObserver;
 import io.quarkus.grpc.GrpcService;
@@ -23,11 +23,20 @@ public class RateLimitServiceImpl
     @Inject
     Redis redis;
 
-    @ConfigProperty(name = "ratelimit.limit")
-    long limit;
+    /**
+     * tenantごとの制限値
+     */
+    private static final Map<String, Long> LIMITS =
+            Map.of(
+                    "gold", 30L,
+                    "silver", 15L,
+                    "free", 5L
+            );
 
-    @ConfigProperty(name = "ratelimit.window-seconds")
-    long windowSeconds;
+    /**
+     * window(sec)
+     */
+    private static final long WINDOW_SECONDS = 60;
 
     @Override
     public void shouldRateLimit(
@@ -36,6 +45,14 @@ public class RateLimitServiceImpl
 
         String clientKey = buildKey(request);
 
+        // tenant抽出
+        String tenant = extractTenant(clientKey);
+
+        // tenant別limit
+        long limit =
+                LIMITS.getOrDefault(tenant, 5L);
+
+        // Redis key
         String redisKey = "rl:" + clientKey;
 
         redis.send(
@@ -55,7 +72,8 @@ public class RateLimitServiceImpl
                     redis.send(
                             Request.cmd(Command.EXPIRE)
                                     .arg(redisKey)
-                                    .arg(String.valueOf(windowSeconds)))
+                                    .arg(String.valueOf(
+                                            WINDOW_SECONDS)))
                     .subscribe()
                     .with(
                             x -> {},
@@ -67,8 +85,10 @@ public class RateLimitServiceImpl
 
                 System.out.println(
                         "RateLimit"
+                        + " tenant=" + tenant
                         + " key=" + redisKey
                         + " count=" + count
+                        + " limit=" + limit
                         + " allowed=" + allowed
                 );
 
@@ -102,12 +122,27 @@ public class RateLimitServiceImpl
     }
 
     /**
+     * tenant抽出
+     */
+    private String extractTenant(String key) {
+
+        for (String token : key.split("\\|")) {
+
+            if (token.startsWith("tenant:")) {
+                return token.substring("tenant:".length());
+            }
+        }
+
+        return "free";
+    }
+
+    /**
      * Envoy descriptor -> Redis key
      */
     private String buildKey(RateLimitRequest request) {
 
         if (request.getDescriptorsList().isEmpty()) {
-            return "global";
+            return "tenant:free";
         }
 
         StringBuilder sb = new StringBuilder();
@@ -121,7 +156,7 @@ public class RateLimitServiceImpl
             )
         );
 
-        // 最後の "|" を削除
+        // 最後の "|" 削除
         if (sb.length() > 0) {
             sb.setLength(sb.length() - 1);
         }
