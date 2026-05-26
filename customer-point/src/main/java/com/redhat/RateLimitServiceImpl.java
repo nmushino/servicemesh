@@ -1,7 +1,5 @@
 package com.redhat;
 
-import java.util.Map;
-
 import jakarta.inject.Inject;
 import jakarta.inject.Singleton;
 
