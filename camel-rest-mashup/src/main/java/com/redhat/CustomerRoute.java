@@ -12,22 +12,24 @@ public class CustomerRoute extends RouteBuilder {
     public void configure() throws Exception {
 
         from("direct:getCustomer")
-                .routeId("customer-route")
+            .routeId("customer-route")
 
-                .setHeader(Exchange.HTTP_METHOD, constant("GET"))
+            .setHeader(Exchange.HTTP_METHOD, constant("GET"))
 
-                // 本来は外部API
-                //.toD("http://customer-api/customers/${header.id}")
+            // 本来は外部API
+            //.toD("http://customer-api/customers/${header.id}")
 
-                // サンプル用Mock
-                .setBody(simple("""
-                    {
-                      "id": "${header.id}",
-                      "name": "Taro Yamada",
-                      "status": "Gold"
-                    }
-                """))
+            // サンプル用Mock
+            .setBody(simple("""
+            {
+              "id": "${header.id}",
+              "name": "Taro Yamada",
+              "status": "Gold"
+            }
+            """))
 
-                .setHeader("type", constant("customer"));
+            .unmarshal().json()
+
+            .setHeader("type", constant("customer"));
     }
 }

@@ -12,17 +12,17 @@ public class PointRoute extends RouteBuilder {
     public void configure() throws Exception {
 
         from("direct:getPoint")
-                .routeId("point-route")
+        .routeId("point-route")
 
-                .setHeader(Exchange.HTTP_METHOD, constant("GET"))
+        .setBody(constant("""
+        {
+        "point": 12800,
+        "rank": "Platinum"
+        }
+        """))
 
-                .setBody(simple("""
-                    {
-                      "point": 12800,
-                      "rank": "Platinum"
-                    }
-                """))
+        .unmarshal().json()
 
-                .setHeader("type", constant("point"));
+        .setHeader("type", constant("point"));
     }
 }

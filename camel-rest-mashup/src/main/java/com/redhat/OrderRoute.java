@@ -11,24 +11,24 @@ public class OrderRoute extends RouteBuilder {
     @Override
     public void configure() throws Exception {
 
-        from("direct:getOrders")
-                .routeId("order-route")
+      from("direct:getOrders")
+      .routeId("order-route")
 
-                .setHeader(Exchange.HTTP_METHOD, constant("GET"))
+      .setBody(constant("""
+      [
+        {
+          "orderId": "A001",
+          "amount": 1200
+        },
+        {
+          "orderId": "A002",
+          "amount": 3400
+        }
+      ]
+      """))
 
-                .setBody(simple("""
-                    [
-                      {
-                        "orderId": "A001",
-                        "amount": 1200
-                      },
-                      {
-                        "orderId": "A002",
-                        "amount": 3400
-                      }
-                    ]
-                """))
+      .unmarshal().json()
 
-                .setHeader("type", constant("orders"));
+      .setHeader("type", constant("orders"));
     }
 }
